@@ -31,7 +31,7 @@
 #include <crypto/algapi.h>
 
 /*
- * 初始化 Cookie 检查器
+ * 初始化 Cookie 检查器(防止ddos)
  * @checker: 要初始化的 Cookie 检查器
  * @wg: 关联的 WireGuard 设备
  * 
