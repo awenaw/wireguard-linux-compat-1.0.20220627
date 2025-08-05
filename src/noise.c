@@ -3,6 +3,47 @@
  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
+/*
+ * WIREGUARD NOISE 协议核心流程:
+ *
+ * 实现了 WireGuard 的 Noise_IKpsk2 握手模式:
+ *
+ * 握手流程:
+ * 1. 发起方 -> 响应方: [初始化消息]
+ *    - wg_noise_handshake_create_initiation()
+ *    - 包含: 临时密钥, 加密的静态密钥, 加密的时间戳
+ *    - 模式: -> e, es, s, ss, {t}
+ *
+ * 2. 响应方处理初始化:
+ *    - wg_noise_handshake_consume_initiation()
+ *    - 验证密钥, 派生共享密钥
+ *    - 如果有效则创建响应
+ *
+ * 3. 响应方 -> 发起方: [响应消息]  
+ *    - wg_noise_handshake_create_response()
+ *    - 包含: 临时密钥, 加密的空载荷
+ *    - 模式: <- e, ee, se, psk, {}
+ *
+ * 4. 发起方处理响应:
+ *    - wg_noise_handshake_consume_response()
+ *    - 派生最终传输密钥
+ *    - 握手完成, 准备数据传输
+ *
+ * 密钥派生链:
+ * handshake_init_chaining_key -> 与DH结果混合 -> 传输密钥
+ * 
+ * 传输模式:
+ * - wg_noise_keypair_encrypt() - 加密出站数据包
+ * - wg_noise_keypair_decrypt() - 解密入站数据包
+ * - 使用 ChaCha20Poly1305 配合每包递增的随机数
+ *
+ * 安全属性:
+ * - 完美前向保密 (临时密钥)
+ * - 双向认证 (静态密钥 + PSK)
+ * - 重放保护 (时间戳 + 计数器)
+ * - 身份隐藏 (加密的静态密钥)
+ */
+
 #include "noise.h"
 #include "device.h"
 #include "peer.h"
