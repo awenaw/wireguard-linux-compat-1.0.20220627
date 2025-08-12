@@ -20,12 +20,13 @@
 static int __init wg_mod_init(void)
 {
 	int ret;
-
+	// 1. 加密子系统初始化
 	if ((ret = chacha20_mod_init()) || (ret = poly1305_mod_init()) ||
 	    (ret = chacha20poly1305_mod_init()) || (ret = blake2s_mod_init()) ||
 	    (ret = curve25519_mod_init()))
 		return ret;
 
+    // 2. AllowedIPs 内存池初始化
 	ret = wg_allowedips_slab_init();
 	if (ret < 0)
 		goto err_allowedips;
@@ -36,16 +37,19 @@ static int __init wg_mod_init(void)
 	    !wg_ratelimiter_selftest())
 		goto err_peer;
 #endif
+	// 3. Noise 协议初始化
 	wg_noise_init();
-
+    // 4. Peer 子系统初始化（创建内存缓存池）
 	ret = wg_peer_init();
 	if (ret < 0)
 		goto err_peer;
 
+	// 5. Device 子系统初始化（注册netlink操作）
 	ret = wg_device_init();
 	if (ret < 0)
 		goto err_device;
 
+	// 6. Netlink 接口初始化
 	ret = wg_genetlink_init();
 	if (ret < 0)
 		goto err_netlink;
