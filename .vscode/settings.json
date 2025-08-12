@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "queueing.h": "c",
+        "ratelimiter.h": "c",
+        "messages.h": "c",
+        "peer.h": "c",
+        "dst_cache.h": "c",
+        "ptr_ring.h": "c"
+    }
+}
