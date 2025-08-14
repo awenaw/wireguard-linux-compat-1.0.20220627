@@ -10,6 +10,7 @@
         "locale": "c",
         "string": "c",
         "ios": "c",
-        "typeinfo": "c"
+        "typeinfo": "c",
+        "__node_handle": "c"
     }
 }

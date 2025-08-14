@@ -758,6 +758,9 @@ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
 	/* 根据数据包的协议类型判断IP版本 */
 	if (skb->protocol == htons(ETH_P_IP))
 		/* IPv4数据包：在IPv4树中查找源地址 */
+		// table->root4 是一个指向IPv4前缀树（trie）根节点的RCU指针 --aw
+		// ip_hdr(skb) 函数 返回指向IPv4头部的指针，类型为 struct iphdr *
+		// &ip_hdr(skb)->saddr  // 要查找的IP地址 --aw
 		return lookup(table->root4, 32, &ip_hdr(skb)->saddr);
 	else if (skb->protocol == htons(ETH_P_IPV6))
 		/* IPv6数据包：在IPv6树中查找源地址 */
