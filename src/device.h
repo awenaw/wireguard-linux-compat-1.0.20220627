@@ -38,7 +38,7 @@ struct prev_queue {
 };
 
 struct wg_device {
-	struct net_device *dev;
+	struct net_device *dev;// aw：指向内核（ 指向标准网络设备）
 	struct crypt_queue encrypt_queue, decrypt_queue, handshake_queue;
 	struct sock __rcu *sock4, *sock6;
 	struct net __rcu *creating_net;

@@ -11,6 +11,9 @@
         "string": "c",
         "ios": "c",
         "typeinfo": "c",
-        "__node_handle": "c"
+        "__node_handle": "c",
+        "peerlookup.h": "c",
+        "curve25519.h": "c",
+        "chacha20poly1305.h": "c"
     }
 }
