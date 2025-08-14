@@ -3,6 +3,7 @@
     "allow": [
       "Bash(grep:*)"
     ],
-    "deny": []
+    "deny": [],
+    "defaultMode": "acceptEdits"
   }
 }

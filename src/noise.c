@@ -504,7 +504,7 @@ static void message_ephemeral(u8 ephemeral_dst[NOISE_PUBLIC_KEY_LEN],
 	    NOISE_PUBLIC_KEY_LEN, chaining_key);
 }
 
-static void tai64n_now(u8 output[NOISE_TIMESTAMP_LEN])
+static void tai64n_now(u8 output[NOISE_TIMESTAMP_LEN])// 加密时间戳
 {
 	struct timespec64 now;
 
