@@ -9,6 +9,7 @@
         "ptr_ring.h": "c",
         "locale": "c",
         "string": "c",
-        "ios": "c"
+        "ios": "c",
+        "typeinfo": "c"
     }
 }
