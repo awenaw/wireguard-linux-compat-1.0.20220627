@@ -3,6 +3,10 @@
  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
+// --aw 多核并行加密：在多个 CPU 核心上并行加密出站数据包，然后在单个核心上按顺序发送
+// 工作队列管理：使用工作队列和环形缓冲区来管理并行处理
+// 握手消息处理：发送协议握手和 cookie 消息
+
 /*
  * WireGuard 数据包发送模块
  * 

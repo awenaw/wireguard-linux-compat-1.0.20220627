@@ -165,6 +165,7 @@ out:
 #endif
 }
 
+// 发送数据包给对端节点
 int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
 {
 	size_t skb_len = skb->len;
@@ -186,6 +187,7 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
 	return ret;
 }
 
+// 发送缓冲区数据
 int wg_socket_send_buffer_to_peer(struct wg_peer *peer, void *buffer,
 				  size_t len, u8 ds)
 {
@@ -270,6 +272,7 @@ static bool endpoint_eq(const struct endpoint *a, const struct endpoint *b)
 	       unlikely(!a->addr.sa_family && !b->addr.sa_family);
 }
 
+// 设置对端节点端点
 void wg_socket_set_peer_endpoint(struct wg_peer *peer,
 				 const struct endpoint *endpoint)
 {
@@ -346,6 +349,7 @@ static void set_sock_opts(struct socket *sock)
 	sk_set_memalloc(sock->sk);
 }
 
+// 初始化 socket
 int wg_socket_init(struct wg_device *wg, u16 port)
 {
 	struct net *net;

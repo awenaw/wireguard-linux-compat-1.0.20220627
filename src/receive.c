@@ -555,6 +555,7 @@ err_keypair:
 	dev_kfree_skb(skb);
 }
 
+// --aw 数据入口，wg在这里开始收数
 void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
 {
     // 1. 预处理包头，验证基本格式和长度
