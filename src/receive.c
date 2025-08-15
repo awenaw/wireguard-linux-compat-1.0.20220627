@@ -557,46 +557,72 @@ err_keypair:
 
 void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
 {
-	if (unlikely(prepare_skb_header(skb, wg) < 0))
-		goto err;
-	switch (SKB_TYPE_LE32(skb)) {
-	case cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION):
-	case cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE):
-	case cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE): {
-		int cpu, ret = -EBUSY;
+    // 1. 预处理包头，验证基本格式和长度
+    if (unlikely(prepare_skb_header(skb, wg) < 0))
+        goto err;
+        
+    // 2. 根据包类型分发处理
+    switch (SKB_TYPE_LE32(skb)) {
+    
+    // 握手相关包：INITIATION/RESPONSE/COOKIE
+    case cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION):
+    case cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE):
+    case cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE): {
+        int cpu, ret = -EBUSY;
 
-		if (unlikely(!rng_is_initialized()))
-			goto drop;
-		if (atomic_read(&wg->handshake_queue_len) > MAX_QUEUED_INCOMING_HANDSHAKES / 2) {
-			if (spin_trylock_bh(&wg->handshake_queue.ring.producer_lock)) {
-				ret = __ptr_ring_produce(&wg->handshake_queue.ring, skb);
-				spin_unlock_bh(&wg->handshake_queue.ring.producer_lock);
-			}
-		} else
-			ret = ptr_ring_produce_bh(&wg->handshake_queue.ring, skb);
-		if (ret) {
-	drop:
-			net_dbg_skb_ratelimited("%s: Dropping handshake packet from %pISpfsc\n",
-						wg->dev->name, skb);
-			goto err;
-		}
-		atomic_inc(&wg->handshake_queue_len);
-		cpu = wg_cpumask_next_online(&wg->handshake_queue.last_cpu);
+        // 确保随机数生成器已初始化（握手需要随机数）
+        if (unlikely(!rng_is_initialized()))
+            goto drop;
+            
+        // 握手队列拥塞控制：当队列超过一半时使用非阻塞入队
+        if (atomic_read(&wg->handshake_queue_len) > MAX_QUEUED_INCOMING_HANDSHAKES / 2) {
+            // 尝试获取生产者锁，失败则丢包（防阻塞）
+            if (spin_trylock_bh(&wg->handshake_queue.ring.producer_lock)) {
+                ret = __ptr_ring_produce(&wg->handshake_queue.ring, skb);
+                spin_unlock_bh(&wg->handshake_queue.ring.producer_lock);
+            }
+        } else
+            // 队列不拥塞时使用阻塞入队
+            ret = ptr_ring_produce_bh(&wg->handshake_queue.ring, skb);
+            
+        if (ret) {
+    drop:
+            // 入队失败，记录并丢弃包
+            net_dbg_skb_ratelimited("%s: Dropping handshake packet from %pISpfsc\n",
+                        wg->dev->name, skb);
+            goto err;
+        }
+        
+        // 更新队列长度计数
+        atomic_inc(&wg->handshake_queue_len);
+        
+        // 选择下一个在线CPU进行负载均衡
+        cpu = wg_cpumask_next_online(&wg->handshake_queue.last_cpu);
+        
+        // 在选定CPU上异步处理握手包
+        // 调用 packet_process_queued_handshake_packets()
 		/* Queues up a call to packet_process_queued_handshake_packets(skb): */
-		queue_work_on(cpu, wg->handshake_receive_wq,
-			      &per_cpu_ptr(wg->handshake_queue.worker, cpu)->work);
-		break;
-	}
-	case cpu_to_le32(MESSAGE_DATA):
-		PACKET_CB(skb)->ds = ip_tunnel_get_dsfield(ip_hdr(skb), skb);
-		wg_packet_consume_data(wg, skb);
-		break;
-	default:
-		WARN(1, "Non-exhaustive parsing of packet header lead to unknown packet type!\n");
-		goto err;
-	}
-	return;
+        queue_work_on(cpu, wg->handshake_receive_wq,
+                  &per_cpu_ptr(wg->handshake_queue.worker, cpu)->work);
+        break;
+    }
+    
+    // 数据包：直接同步处理
+    case cpu_to_le32(MESSAGE_DATA):
+        // 保存QoS信息用于后续处理
+        PACKET_CB(skb)->ds = ip_tunnel_get_dsfield(ip_hdr(skb), skb);
+        // 立即解密和转发数据包
+        wg_packet_consume_data(wg, skb);
+        break;
+        
+    default:
+        // 未知包类型，报警并丢弃
+        WARN(1, "Non-exhaustive parsing of packet header lead to unknown packet type!\n");
+        goto err;
+    }
+    return;
 
 err:
-	dev_kfree_skb(skb);
+    // 错误处理：释放包内存
+    dev_kfree_skb(skb);
 }
