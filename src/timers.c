@@ -3,6 +3,51 @@
  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
+/*
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                           WireGuard 定时器管理模块                           ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  此模块实现 WireGuard 协议中的关键定时器机制，负责管理连接的生命周期        ║
+ * ║                                                                              ║
+ * ║  ┌─────────────────────────────────────────────────────────────────────┐    ║
+ * ║  │                      定时器架构图                                   │    ║
+ * ║  │                                                                     │    ║
+ * ║  │  握手重传定时器 ←─────┐                                              │    ║
+ * ║  │       ↓              │                                              │    ║
+ * ║  │  [握手发起] ────→ [等待响应] ───timeout──→ [重传/放弃]              │    ║
+ * ║  │       ↓              │             ↑                               │    ║
+ * ║  │  保活发送定时器      │      新握手定时器                           │    ║
+ * ║  │       ↓              │             ↑                               │    ║
+ * ║  │  [数据传输] ────→ [连接活跃] ───timeout──→ [发起新握手]            │    ║
+ * ║  │       ↓                            ↑                               │    ║
+ * ║  │  密钥清零定时器 ──────────────────────                             │    ║
+ * ║  │       ↓                                                            │    ║
+ * ║  │  [清理过期密钥]                                                      │    ║
+ * ║  │       ↓                                                            │    ║
+ * ║  │  持久保活定时器（可选）                                              │    ║
+ * ║  └─────────────────────────────────────────────────────────────────────┘    ║
+ * ║                                                                              ║
+ * ║  五个核心定时器的作用：                                                      ║
+ * ║  ┌──────────────────────────────────────────────────────────────────────┐   ║
+ * ║  │ 1. 握手重传定时器 - 如果在 REKEY_TIMEOUT + 随机抖动 毫秒后未收到     │   ║
+ * ║  │    握手响应，则重新发送握手请求                                      │   ║
+ * ║  │                                                                      │   ║
+ * ║  │ 2. 保活发送定时器 - 如果已收到数据包但在 KEEPALIVE_TIMEOUT 毫秒后   │   ║
+ * ║  │    未发送任何数据，则发送空的保活包                                  │   ║
+ * ║  │                                                                      │   ║
+ * ║  │ 3. 新握手定时器 - 如果已发送数据包但在 (KEEPALIVE_TIMEOUT +        │   ║
+ * ║  │    REKEY_TIMEOUT) + 抖动 毫秒后未收到任何包（包括空包），则发起新握手│   ║
+ * ║  │                                                                      │   ║
+ * ║  │ 4. 密钥清零定时器 - 如果在 (REJECT_AFTER_TIME * 3) 毫秒后未收到新   │   ║
+ * ║  │    密钥，则清零所有临时密钥                                          │   ║
+ * ║  │                                                                      │   ║
+ * ║  │ 5. 持久保活定时器 - 如果启用，每隔用户指定的秒数发送一个空的         │   ║
+ * ║  │    认证数据包                                                        │   ║
+ * ║  └──────────────────────────────────────────────────────────────────────┘   ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
+
 #include "timers.h"
 #include "device.h"
 #include "peer.h"
@@ -10,234 +55,631 @@
 #include "socket.h"
 
 /*
- * - Timer for retransmitting the handshake if we don't hear back after
- * `REKEY_TIMEOUT + jitter` ms.
- *
- * - Timer for sending empty packet if we have received a packet but after have
- * not sent one for `KEEPALIVE_TIMEOUT` ms.
- *
- * - Timer for initiating new handshake if we have sent a packet but after have
- * not received one (even empty) for `(KEEPALIVE_TIMEOUT + REKEY_TIMEOUT) +
- * jitter` ms.
- *
- * - Timer for zeroing out all ephemeral keys after `(REJECT_AFTER_TIME * 3)` ms
- * if no new keys have been received.
- *
- * - Timer for, if enabled, sending an empty authenticated packet every user-
- * specified seconds.
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                            安全定时器修改函数                               │
+ * │                                                                              │
+ * │  功能：安全地修改对等节点的定时器到期时间                                    │
+ * │  参数：peer - 对等节点指针                                                   │
+ * │        timer - 要修改的定时器                                               │
+ * │        expires - 新的到期时间（以jiffies为单位）                            │
+ * │                                                                              │
+ * │  安全措施：                                                                  │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ RCU读锁（禁用软中断） → 检查网络接口运行状态 → 检查节点存活状态   │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  只有在网络接口运行且对等节点未被标记为死亡时，才会修改定时器                │
+ * └──────────────────────────────────────────────────────────────────────────────┘
  */
-
 static inline void mod_peer_timer(struct wg_peer *peer,
 				  struct timer_list *timer,
 				  unsigned long expires)
 {
-	rcu_read_lock_bh();
-	if (likely(netif_running(peer->device->dev) &&
-		   !READ_ONCE(peer->is_dead)))
-		mod_timer(timer, expires);
-	rcu_read_unlock_bh();
+	rcu_read_lock_bh();         // 获取RCU读锁并禁用软中断，确保原子操作
+	if (likely(netif_running(peer->device->dev) &&     // 检查网络设备是否运行
+		   !READ_ONCE(peer->is_dead)))              // 检查对等节点是否存活
+		mod_timer(timer, expires);              // 修改定时器到期时间
+	rcu_read_unlock_bh();       // 释放RCU读锁并重新启用软中断
 }
 
+/*
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                         握手重传定时器过期处理函数                           ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  当握手重传定时器过期时调用此函数，处理握手超时的情况                        ║
+ * ║                                                                              ║
+ * ║  处理流程：                                                                  ║
+ * ║  ┌────────────────────────────────────────────────────────────────────┐     ║
+ * ║  │                       握手重传逻辑图                               │     ║
+ * ║  │                                                                    │     ║
+ * ║  │  定时器过期 → 检查重试次数                                          │     ║
+ * ║  │       ↓               ↓                                            │     ║
+ * ║  │  超过MAX_TIMER_HANDSHAKES?                                         │     ║
+ * ║  │       ↓               ↓                                            │     ║
+ * ║  │     是的             不是                                          │     ║
+ * ║  │       ↓               ↓                                            │     ║
+ * ║  │  ┌─放弃握手─┐    ┌─重试握手─┐                                      │     ║
+ * ║  │  │删除定时器│    │增加计数器│                                      │     ║
+ * ║  │  │清理数据包│    │清理端点  │                                      │     ║
+ * ║  │  │设置密钥清│    │重发握手  │                                      │     ║
+ * ║  │  │零定时器  │    │初始化包  │                                      │     ║
+ * ║  │  └─────────┘    └─────────┘                                       │     ║
+ * ║  └────────────────────────────────────────────────────────────────────┘     ║
+ * ║                                                                              ║
+ * ║  参数：timer - 过期的定时器指针                                              ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
 static void wg_expired_retransmit_handshake(struct timer_list *timer)
 {
+	// 从定时器获取对等节点指针
 	struct wg_peer *peer = from_timer(peer, timer,
 					  timer_retransmit_handshake);
 
+	// 检查握手重试次数是否超过最大限制
 	if (peer->timer_handshake_attempts > MAX_TIMER_HANDSHAKES) {
+		// 超过最大重试次数，放弃握手并记录调试信息
 		pr_debug("%s: Handshake for peer %llu (%pISpfsc) did not complete after %d attempts, giving up\n",
 			 peer->device->dev->name, peer->internal_id,
 			 &peer->endpoint.addr, MAX_TIMER_HANDSHAKES + 2);
 
-		del_timer(&peer->timer_send_keepalive);
-		/* We drop all packets without a keypair and don't try again,
-		 * if we try unsuccessfully for too long to make a handshake.
+		del_timer(&peer->timer_send_keepalive);    // 删除保活定时器
+		
+		/* 如果握手尝试时间过长，我们丢弃所有没有密钥对的数据包
+		 * 并且不再重试
 		 */
-		wg_packet_purge_staged_packets(peer);
+		wg_packet_purge_staged_packets(peer);      // 清理暂存的数据包
 
-		/* We set a timer for destroying any residue that might be left
-		 * of a partial exchange.
+		/* 设置一个定时器来销毁可能遗留的部分交换数据
 		 */
 		if (!timer_pending(&peer->timer_zero_key_material))
 			mod_peer_timer(peer, &peer->timer_zero_key_material,
 				       jiffies + REJECT_AFTER_TIME * 3 * HZ);
 	} else {
-		++peer->timer_handshake_attempts;
+		// 未超过最大重试次数，继续重试握手
+		++peer->timer_handshake_attempts;         // 增加握手尝试计数
 		pr_debug("%s: Handshake for peer %llu (%pISpfsc) did not complete after %d seconds, retrying (try %d)\n",
 			 peer->device->dev->name, peer->internal_id,
 			 &peer->endpoint.addr, REKEY_TIMEOUT,
 			 peer->timer_handshake_attempts + 1);
 
-		/* We clear the endpoint address src address, in case this is
-		 * the cause of trouble.
+		/* 清除端点地址的源地址，以防这是问题的原因
 		 */
 		wg_socket_clear_peer_endpoint_src(peer);
 
+		// 重新发送排队的握手初始化包
 		wg_packet_send_queued_handshake_initiation(peer, true);
 	}
 }
 
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                        保活包发送定时器过期处理函数                          │
+ * │                                                                              │
+ * │  当保活发送定时器过期时调用，用于维持连接活跃状态                            │
+ * │                                                                              │
+ * │  工作流程：                                                                  │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ 定时器过期 → 发送保活包 → 检查是否需要另一个保活包                 │     │
+ * │  │     ↓             ↓              ↓                                 │     │
+ * │  │ 从定时器获取   调用保活包    如果标志位为true                       │     │
+ * │  │ 对等节点指针   发送函数      则重置标志并设置                       │     │
+ * │  │                             下一个保活定时器                       │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  参数：timer - 过期的定时器指针                                              │
+ * └──────────────────────────────────────────────────────────────────────────────┘
+ */
 static void wg_expired_send_keepalive(struct timer_list *timer)
 {
+	// 从定时器获取对等节点指针
 	struct wg_peer *peer = from_timer(peer, timer, timer_send_keepalive);
 
-	wg_packet_send_keepalive(peer);
+	wg_packet_send_keepalive(peer);                    // 发送保活包
+	
+	// 检查是否需要发送另一个保活包（在保活周期内可能有多个数据包到达）
 	if (peer->timer_need_another_keepalive) {
-		peer->timer_need_another_keepalive = false;
+		peer->timer_need_another_keepalive = false;    // 重置标志位
 		mod_peer_timer(peer, &peer->timer_send_keepalive,
-			       jiffies + KEEPALIVE_TIMEOUT * HZ);
+			       jiffies + KEEPALIVE_TIMEOUT * HZ);  // 设置下一个保活定时器
 	}
 }
 
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                        新握手定时器过期处理函数                              │
+ * │                                                                              │
+ * │  当新握手定时器过期时调用，表示长时间未收到对等节点的任何响应                │
+ * │  需要发起新的握手流程以重新建立安全连接                                      │
+ * │                                                                              │
+ * │  触发条件：                                                                  │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ 在 (KEEPALIVE_TIMEOUT + REKEY_TIMEOUT) + 抖动 毫秒内                │     │
+ * │  │ 未收到来自对等节点的任何数据包（包括保活包）                       │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  处理步骤：                                                                  │
+ * │  1. 记录调试日志说明重试原因                                                 │
+ * │  2. 清除端点源地址（可能是网络变化导致的问题）                               │
+ * │  3. 发送新的握手初始化包                                                     │
+ * │                                                                              │
+ * │  参数：timer - 过期的定时器指针                                              │
+ * └──────────────────────────────────────────────────────────────────────────────┘
+ */
 static void wg_expired_new_handshake(struct timer_list *timer)
 {
+	// 从定时器获取对等节点指针
 	struct wg_peer *peer = from_timer(peer, timer, timer_new_handshake);
 
+	// 记录调试信息，说明为什么需要重新握手
 	pr_debug("%s: Retrying handshake with peer %llu (%pISpfsc) because we stopped hearing back after %d seconds\n",
 		 peer->device->dev->name, peer->internal_id,
 		 &peer->endpoint.addr, KEEPALIVE_TIMEOUT + REKEY_TIMEOUT);
-	/* We clear the endpoint address src address, in case this is the cause
-	 * of trouble.
+		 
+	/* 清除端点地址的源地址，以防这是问题的原因
+	 * (例如：NAT映射改变、网络路径变更等)
 	 */
 	wg_socket_clear_peer_endpoint_src(peer);
+	
+	// 发送排队的握手初始化包，参数false表示这不是重传而是新的握手
 	wg_packet_send_queued_handshake_initiation(peer, false);
 }
 
+/*
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                        密钥材料清零定时器过期处理函数                        ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  当密钥清零定时器过期时调用，用于清理过期的加密密钥材料                      ║
+ * ║  这是WireGuard协议的安全机制，确保旧密钥不会被无限期保留                     ║
+ * ║                                                                              ║
+ * ║  安全考虑：                                                                  ║
+ * ║  ┌────────────────────────────────────────────────────────────────────┐     ║
+ * ║  │ • 在 (REJECT_AFTER_TIME * 3) 毫秒后如果没有收到新密钥，              │     ║
+ * ║  │   则清零所有临时密钥材料                                           │     ║
+ * ║  │ • 防止使用过期密钥进行通信                                         │     ║
+ * ║  │ • 强制重新进行密钥协商                                             │     ║
+ * ║  │ • 提供前向安全性保证                                               │     ║
+ * ║  └────────────────────────────────────────────────────────────────────┘     ║
+ * ║                                                                              ║
+ * ║  处理流程：                                                                  ║
+ * ║  RCU读锁 → 检查节点存活 → 增加引用计数 → 排队工作任务 → 释放RCU锁           ║
+ * ║                                                                              ║
+ * ║  参数：timer - 过期的定时器指针                                              ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
 static void wg_expired_zero_key_material(struct timer_list *timer)
 {
+	// 从定时器获取对等节点指针
 	struct wg_peer *peer = from_timer(peer, timer, timer_zero_key_material);
 
-	rcu_read_lock_bh();
-	if (!READ_ONCE(peer->is_dead)) {
-		wg_peer_get(peer);
+	rcu_read_lock_bh();                                 // 获取RCU读锁并禁用软中断
+	if (!READ_ONCE(peer->is_dead)) {                    // 检查对等节点是否仍然存活
+		wg_peer_get(peer);                          // 增加对等节点的引用计数
+		
+		// 将清理工作排队到握手发送工作队列
 		if (!queue_work(peer->device->handshake_send_wq,
 				&peer->clear_peer_work))
-			/* If the work was already on the queue, we want to drop
-			 * the extra reference.
+			/* 如果工作已经在队列中，我们需要释放额外的引用
+			 * 避免引用计数泄漏
 			 */
-			wg_peer_put(peer);
+			wg_peer_put(peer);              // 释放额外的引用
 	}
-	rcu_read_unlock_bh();
+	rcu_read_unlock_bh();                               // 释放RCU读锁并重新启用软中断
 }
 
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                     排队的密钥材料清零工作处理函数                           │
+ * │                                                                              │
+ * │  这是实际执行密钥清理工作的函数，由工作队列调度执行                          │
+ * │  将密钥清理工作从定时器中断上下文移到工作队列上下文                          │
+ * │                                                                              │
+ * │  清理内容：                                                                  │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ 1. 握手状态清零 - 清除正在进行的握手协商数据                       │     │
+ * │  │ 2. 密钥对清零   - 清除所有当前和历史的加密密钥                     │     │
+ * │  │ 3. 引用计数减少 - 释放在定时器处理中获取的对等节点引用             │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  安全效果：强制对等节点重新进行完整的握手流程才能继续通信                    │
+ * │                                                                              │
+ * │  参数：work - 工作结构体指针                                                 │
+ * └──────────────────────────────────────────────────────────────────────────────┘
+ */
 static void wg_queued_expired_zero_key_material(struct work_struct *work)
 {
+	// 从工作结构体获取包含它的对等节点指针
 	struct wg_peer *peer = container_of(work, struct wg_peer,
 					    clear_peer_work);
 
+	// 记录密钥清零的调试信息
 	pr_debug("%s: Zeroing out all keys for peer %llu (%pISpfsc), since we haven't received a new one in %d seconds\n",
 		 peer->device->dev->name, peer->internal_id,
 		 &peer->endpoint.addr, REJECT_AFTER_TIME * 3);
-	wg_noise_handshake_clear(&peer->handshake);
-	wg_noise_keypairs_clear(&peer->keypairs);
-	wg_peer_put(peer);
+		 
+	wg_noise_handshake_clear(&peer->handshake);         // 清零握手状态和临时数据
+	wg_noise_keypairs_clear(&peer->keypairs);           // 清零所有密钥对
+	wg_peer_put(peer);                                  // 释放对等节点引用计数
 }
 
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                        持久保活定时器过期处理函数                            │
+ * │                                                                              │
+ * │  当持久保活定时器过期时调用，用于定期发送保活包                              │
+ * │  这是用户可配置的功能，用于穿透NAT和防火墙                                   │
+ * │                                                                              │
+ * │  应用场景：                                                                  │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ • NAT穿透 - 保持NAT映射表项活跃                                    │     │
+ * │  │ • 防火墙穿透 - 防止状态防火墙关闭连接                             │     │
+ * │  │ • 连接检测 - 主动探测连接是否仍然可用                             │     │
+ * │  │ • 移动网络 - 在网络切换时保持连接                                 │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  工作原理：如果配置了持久保活间隔，则定期发送空的认证数据包                  │
+ * │                                                                              │
+ * │  参数：timer - 过期的定时器指针                                              │
+ * └──────────────────────────────────────────────────────────────────────────────┘
+ */
 static void wg_expired_send_persistent_keepalive(struct timer_list *timer)
 {
+	// 从定时器获取对等节点指针
 	struct wg_peer *peer = from_timer(peer, timer,
 					  timer_persistent_keepalive);
 
+	// 检查是否配置了持久保活间隔（非零值表示启用）
 	if (likely(peer->persistent_keepalive_interval))
-		wg_packet_send_keepalive(peer);
+		wg_packet_send_keepalive(peer);         // 发送保活包
 }
 
-/* Should be called after an authenticated data packet is sent. */
+/*
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                       认证数据包发送后的定时器更新                           ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  在发送认证数据包后调用此函数，用于启动或重置新握手定时器                    ║
+ * ║                                                                              ║
+ * ║  调用时机：每当发送一个经过认证的数据包时                                    ║
+ * ║                                                                              ║
+ * ║  定时器逻辑：                                                                ║
+ * ║  ┌────────────────────────────────────────────────────────────────────┐     ║
+ * ║  │ 如果新握手定时器尚未运行，则启动它                                 │     ║
+ * ║  │ 超时时间 = (KEEPALIVE_TIMEOUT + REKEY_TIMEOUT) + 随机抖动          │     ║
+ * ║  │                                                                    │     ║
+ * ║  │ 目的：确保如果长时间没有收到对方的响应，会触发新的握手流程         │     ║
+ * ║  └────────────────────────────────────────────────────────────────────┘     ║
+ * ║                                                                              ║
+ * ║  抖动的作用：防止多个对等节点同时发起握手造成的网络拥塞                      ║
+ * ║                                                                              ║
+ * ║  参数：peer - 发送数据包的对等节点                                           ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
 void wg_timers_data_sent(struct wg_peer *peer)
 {
+	// 如果新握手定时器没有运行，则设置它
 	if (!timer_pending(&peer->timer_new_handshake))
 		mod_peer_timer(peer, &peer->timer_new_handshake,
-			jiffies + (KEEPALIVE_TIMEOUT + REKEY_TIMEOUT) * HZ +
-			prandom_u32_max(REKEY_TIMEOUT_JITTER_MAX_JIFFIES));
+			jiffies + (KEEPALIVE_TIMEOUT + REKEY_TIMEOUT) * HZ +  // 基础超时
+			prandom_u32_max(REKEY_TIMEOUT_JITTER_MAX_JIFFIES));   // 加上随机抖动
 }
 
-/* Should be called after an authenticated data packet is received. */
+/*
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                       认证数据包接收后的定时器更新                           ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  在接收到认证数据包后调用此函数，用于管理保活包发送定时器                    ║
+ * ║                                                                              ║
+ * ║  调用时机：每当接收到一个经过认证的数据包时                                  ║
+ * ║                                                                              ║
+ * ║  定时器逻辑：                                                                ║
+ * ║  ┌────────────────────────────────────────────────────────────────────┐     ║
+ * ║  │ 网络接口运行？                                                     │     ║
+ * ║  │     ↓                                                              │     ║
+ * ║  │   是的                                                             │     ║
+ * ║  │     ↓                                                              │     ║
+ * ║  │ 保活发送定时器是否已运行？                                         │     ║
+ * ║  │     ↓              ↓                                               │     ║
+ * ║  │   未运行          已运行                                           │     ║
+ * ║  │     ↓              ↓                                               │     ║
+ * ║  │ 启动保活定时器    设置"需要另一个保活"标志                         │     ║
+ * ║  └────────────────────────────────────────────────────────────────────┘     ║
+ * ║                                                                              ║
+ * ║  目的：确保在接收到数据后，如果一段时间内没有发送数据，则发送保活包          ║
+ * ║                                                                              ║
+ * ║  参数：peer - 接收数据包的对等节点                                           ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
 void wg_timers_data_received(struct wg_peer *peer)
 {
-	if (likely(netif_running(peer->device->dev))) {
-		if (!timer_pending(&peer->timer_send_keepalive))
+	if (likely(netif_running(peer->device->dev))) {      // 检查网络接口是否运行
+		if (!timer_pending(&peer->timer_send_keepalive))     // 保活定时器未运行？
 			mod_peer_timer(peer, &peer->timer_send_keepalive,
-				       jiffies + KEEPALIVE_TIMEOUT * HZ);
+				       jiffies + KEEPALIVE_TIMEOUT * HZ); // 启动保活定时器
 		else
-			peer->timer_need_another_keepalive = true;
+			peer->timer_need_another_keepalive = true;   // 标记需要另一个保活包
 	}
 }
 
-/* Should be called after any type of authenticated packet is sent, whether
- * keepalive, data, or handshake.
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                      任何认证包发送后的定时器更新                            │
+ * │                                                                              │
+ * │  在发送任何类型的认证包后调用（保活包、数据包或握手包）                      │
+ * │                                                                              │
+ * │  包含的包类型：                                                              │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ • 保活包 (Keepalive) - 空的认证数据包                              │     │
+ * │  │ • 数据包 (Data) - 用户数据的加密传输                               │     │
+ * │  │ • 握手包 (Handshake) - 密钥协商消息                               │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  逻辑原理：                                                                  │
+ * │  既然我们刚刚发送了一个包，就不需要立即发送保活包了                          │
+ * │  因此删除保活发送定时器，避免不必要的网络流量                                │
+ * │                                                                              │
+ * │  优化效果：减少网络带宽消耗，提高协议效率                                    │
+ * │                                                                              │
+ * │  参数：peer - 发送包的对等节点                                               │
+ * └──────────────────────────────────────────────────────────────────────────────┘
  */
 void wg_timers_any_authenticated_packet_sent(struct wg_peer *peer)
 {
-	del_timer(&peer->timer_send_keepalive);
+	del_timer(&peer->timer_send_keepalive);         // 删除保活发送定时器
 }
 
-/* Should be called after any type of authenticated packet is received, whether
- * keepalive, data, or handshake.
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                      任何认证包接收后的定时器更新                            │
+ * │                                                                              │
+ * │  在接收到任何类型的认证包后调用（保活包、数据包或握手包）                    │
+ * │                                                                              │
+ * │  包含的包类型：                                                              │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ • 保活包 (Keepalive) - 对方发送的空认证包                          │     │
+ * │  │ • 数据包 (Data) - 对方发送的加密用户数据                           │     │
+ * │  │ • 握手包 (Handshake) - 对方发送的密钥协商消息                      │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  逻辑原理：                                                                  │
+ * │  既然我们收到了对方的认证包，说明连接是活跃的                                │
+ * │  因此不需要发起新握手，删除新握手定时器                                      │
+ * │                                                                              │
+ * │  效果：避免不必要的握手协商，保持连接稳定                                    │
+ * │                                                                              │
+ * │  参数：peer - 接收包的对等节点                                               │
+ * └──────────────────────────────────────────────────────────────────────────────┘
  */
 void wg_timers_any_authenticated_packet_received(struct wg_peer *peer)
 {
-	del_timer(&peer->timer_new_handshake);
+	del_timer(&peer->timer_new_handshake);          // 删除新握手定时器
 }
 
-/* Should be called after a handshake initiation message is sent. */
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                        握手初始化消息发送后的定时器设置                      │
+ * │                                                                              │
+ * │  在发送握手初始化消息后调用此函数，启动握手重传定时器                        │
+ * │                                                                              │
+ * │  调用时机：每当向对等节点发送握手初始化消息时                                │
+ * │                                                                              │
+ * │  定时器设置：                                                                │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ 超时时间 = REKEY_TIMEOUT + 随机抖动                                │     │
+ * │  │                                                                    │     │
+ * │  │ 如果在此时间内未收到握手响应，将触发握手重传或放弃                 │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  抖动目的：                                                                  │
+ * │  • 防止网络中的多个节点同时重传造成冲突                                      │
+ * │  • 分散网络负载，提高整体性能                                                │
+ * │  • 避免握手风暴                                                              │
+ * │                                                                              │
+ * │  参数：peer - 发送握手初始化的对等节点                                       │
+ * └──────────────────────────────────────────────────────────────────────────────┘
+ */
 void wg_timers_handshake_initiated(struct wg_peer *peer)
 {
 	mod_peer_timer(peer, &peer->timer_retransmit_handshake,
-		       jiffies + REKEY_TIMEOUT * HZ +
-		       prandom_u32_max(REKEY_TIMEOUT_JITTER_MAX_JIFFIES));
+		       jiffies + REKEY_TIMEOUT * HZ +                    // 基础重传超时
+		       prandom_u32_max(REKEY_TIMEOUT_JITTER_MAX_JIFFIES)); // 加上随机抖动
 }
 
-/* Should be called after a handshake response message is received and processed
- * or when getting key confirmation via the first data message.
+/*
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                            握手完成后的状态重置                              ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  在握手响应消息被接收和处理后调用，或通过第一个数据消息获得密钥确认时调用    ║
+ * ║                                                                              ║
+ * ║  调用时机：                                                                  ║
+ * ║  ┌────────────────────────────────────────────────────────────────────┐     ║
+ * ║  │ • 收到并处理握手响应消息后                                         │     ║
+ * ║  │ • 通过第一个数据消息确认密钥有效性后                               │     ║
+ * ║  └────────────────────────────────────────────────────────────────────┘     ║
+ * ║                                                                              ║
+ * ║  执行的清理操作：                                                            ║
+ * ║  ┌────────────────────────────────────────────────────────────────────┐     ║
+ * ║  │ 1. 删除握手重传定时器 - 不再需要重传握手                           │     ║
+ * ║  │ 2. 重置握手尝试计数器 - 为下次握手做准备                           │     ║
+ * ║  │ 3. 清除最后时刻握手标志 - 重置握手状态                             │     ║
+ * ║  │ 4. 记录握手完成的时间戳 - 用于调试和统计                           │     ║
+ * ║  └────────────────────────────────────────────────────────────────────┘     ║
+ * ║                                                                              ║
+ * ║  意义：标志着一次成功的密钥协商完成，连接进入数据传输阶段                    ║
+ * ║                                                                              ║
+ * ║  参数：peer - 完成握手的对等节点                                             ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
  */
 void wg_timers_handshake_complete(struct wg_peer *peer)
 {
-	del_timer(&peer->timer_retransmit_handshake);
-	peer->timer_handshake_attempts = 0;
-	peer->sent_lastminute_handshake = false;
-	ktime_get_real_ts64(&peer->walltime_last_handshake);
+	del_timer(&peer->timer_retransmit_handshake);       // 删除握手重传定时器
+	peer->timer_handshake_attempts = 0;                 // 重置握手尝试计数
+	peer->sent_lastminute_handshake = false;            // 清除最后时刻握手标志
+	ktime_get_real_ts64(&peer->walltime_last_handshake); // 记录握手完成时间戳
 }
 
-/* Should be called after an ephemeral key is created, which is before sending a
- * handshake response or after receiving a handshake response.
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                        会话密钥派生后的定时器设置                            │
+ * │                                                                              │
+ * │  在创建临时密钥后调用，即在发送握手响应前或收到握手响应后                    │
+ * │                                                                              │
+ * │  调用时机：                                                                  │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ • 创建临时（ephemeral）密钥后                                      │     │
+ * │  │ • 发送握手响应消息前                                               │     │
+ * │  │ • 接收握手响应消息后                                               │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  密钥清零定时器：                                                            │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ 超时时间 = REJECT_AFTER_TIME * 3                                   │     │
+ * │  │                                                                    │     │
+ * │  │ 如果在此时间内没有收到新的密钥，将清零所有密钥材料                 │     │
+ * │  │ 强制进行新的握手流程                                               │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  安全考虑：                                                                  │
+ * │  • 限制密钥的生命周期，提供前向安全性                                        │
+ * │  • 防止长期使用同一密钥的安全风险                                            │
+ * │  • 确保定期更新加密上下文                                                    │
+ * │                                                                              │
+ * │  参数：peer - 派生会话密钥的对等节点                                         │
+ * └──────────────────────────────────────────────────────────────────────────────┘
  */
 void wg_timers_session_derived(struct wg_peer *peer)
 {
 	mod_peer_timer(peer, &peer->timer_zero_key_material,
-		       jiffies + REJECT_AFTER_TIME * 3 * HZ);
+		       jiffies + REJECT_AFTER_TIME * 3 * HZ);   // 设置密钥清零定时器
 }
 
-/* Should be called before a packet with authentication, whether
- * keepalive, data, or handshakem is sent, or after one is received.
+/*
+ * ┌──────────────────────────────────────────────────────────────────────────────┐
+ * │                    任何认证包传输时的持久保活定时器更新                      │
+ * │                                                                              │
+ * │  在发送或接收任何认证包时调用（保活包、数据包或握手包）                      │
+ * │                                                                              │
+ * │  包的类型：                                                                  │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ • 保活包 (Keepalive) - 维持连接的空包                              │     │
+ * │  │ • 数据包 (Data) - 实际的用户数据传输                               │     │
+ * │  │ • 握手包 (Handshake) - 密钥协商消息                               │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  功能逻辑：                                                                  │
+ * │  ┌────────────────────────────────────────────────────────────────────┐     │
+ * │  │ 如果配置了持久保活间隔 (persistent_keepalive_interval)             │     │
+ * │  │ 则重置持久保活定时器，确保定期发送保活包                           │     │
+ * │  └────────────────────────────────────────────────────────────────────┘     │
+ * │                                                                              │
+ * │  应用场景：                                                                  │
+ * │  • NAT穿透：保持NAT映射不过期                                                │
+ * │  • 防火墙穿透：维持状态防火墙的连接记录                                      │
+ * │  • 连接保活：确保网络路径始终可达                                            │
+ * │                                                                              │
+ * │  参数：peer - 进行包传输的对等节点                                           │
+ * └──────────────────────────────────────────────────────────────────────────────┘
  */
 void wg_timers_any_authenticated_packet_traversal(struct wg_peer *peer)
 {
+	// 如果配置了持久保活间隔，则重置持久保活定时器
 	if (peer->persistent_keepalive_interval)
 		mod_peer_timer(peer, &peer->timer_persistent_keepalive,
 			jiffies + peer->persistent_keepalive_interval * HZ);
 }
 
+/*
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                           对等节点定时器系统初始化                           ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  初始化对等节点的所有定时器和相关状态变量                                    ║
+ * ║                                                                              ║
+ * ║  初始化的定时器：                                                            ║
+ * ║  ┌────────────────────────────────────────────────────────────────────┐     ║
+ * ║  │ 1. 握手重传定时器 - 处理握手超时和重传                             │     ║
+ * ║  │ 2. 保活发送定时器 - 发送保活包维持连接                             │     ║
+ * ║  │ 3. 新握手定时器   - 长时间无响应时发起新握手                       │     ║
+ * ║  │ 4. 密钥清零定时器 - 清理过期的密钥材料                             │     ║
+ * ║  │ 5. 持久保活定时器 - 用户配置的定期保活                             │     ║
+ * ║  └────────────────────────────────────────────────────────────────────┘     ║
+ * ║                                                                              ║
+ * ║  初始化的工作队列：                                                          ║
+ * ║  • clear_peer_work - 密钥清零工作任务                                        ║
+ * ║                                                                              ║
+ * ║  初始化的状态变量：                                                          ║
+ * ║  • timer_handshake_attempts = 0 - 握手尝试计数                              ║
+ * ║  • sent_lastminute_handshake = false - 最后时刻握手标志                     ║
+ * ║  • timer_need_another_keepalive = false - 需要额外保活标志                  ║
+ * ║                                                                              ║
+ * ║  参数：peer - 要初始化的对等节点                                             ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
 void wg_timers_init(struct wg_peer *peer)
 {
+	// 初始化握手重传定时器
 	timer_setup(&peer->timer_retransmit_handshake,
 		    wg_expired_retransmit_handshake, 0);
+	
+	// 初始化保活发送定时器
 	timer_setup(&peer->timer_send_keepalive, wg_expired_send_keepalive, 0);
+	
+	// 初始化新握手定时器
 	timer_setup(&peer->timer_new_handshake, wg_expired_new_handshake, 0);
+	
+	// 初始化密钥清零定时器
 	timer_setup(&peer->timer_zero_key_material,
 		    wg_expired_zero_key_material, 0);
+	
+	// 初始化持久保活定时器
 	timer_setup(&peer->timer_persistent_keepalive,
 		    wg_expired_send_persistent_keepalive, 0);
+	
+	// 初始化密钥清零工作队列任务
 	INIT_WORK(&peer->clear_peer_work, wg_queued_expired_zero_key_material);
-	peer->timer_handshake_attempts = 0;
-	peer->sent_lastminute_handshake = false;
-	peer->timer_need_another_keepalive = false;
+	
+	// 初始化状态变量
+	peer->timer_handshake_attempts = 0;            // 握手尝试计数归零
+	peer->sent_lastminute_handshake = false;       // 清除最后时刻握手标志
+	peer->timer_need_another_keepalive = false;    // 清除需要额外保活标志
 }
 
+/*
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║                          对等节点定时器系统停止和清理                        ║
+ * ╠══════════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                              ║
+ * ║  安全地停止和清理对等节点的所有定时器和工作队列                              ║
+ * ║  在对等节点被销毁或移除时调用，确保没有遗留的定时器或工作任务                ║
+ * ║                                                                              ║
+ * ║  停止的定时器：                                                              ║
+ * ║  ┌────────────────────────────────────────────────────────────────────┐     ║
+ * ║  │ 1. 握手重传定时器 - 同步删除，等待当前处理完成                     │     ║
+ * ║  │ 2. 保活发送定时器 - 同步删除，防止后续保活包发送                   │     ║
+ * ║  │ 3. 新握手定时器   - 同步删除，停止新握手发起                       │     ║
+ * ║  │ 4. 密钥清零定时器 - 同步删除，停止密钥清理操作                     │     ║
+ * ║  │ 5. 持久保活定时器 - 同步删除，停止定期保活                         │     ║
+ * ║  └────────────────────────────────────────────────────────────────────┘     ║
+ * ║                                                                              ║
+ * ║  清理的工作队列：                                                            ║
+ * ║  • clear_peer_work - 确保密钥清零工作完成或被取消                            ║
+ * ║                                                                              ║
+ * ║  安全措施：                                                                  ║
+ * ║  • del_timer_sync() - 同步删除，确保定时器处理函数完全退出                  ║
+ * ║  • flush_work() - 等待工作队列任务完成，防止访问已释放的内存                ║
+ * ║                                                                              ║
+ * ║  参数：peer - 要停止定时器的对等节点                                         ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ */
 void wg_timers_stop(struct wg_peer *peer)
 {
-	del_timer_sync(&peer->timer_retransmit_handshake);
-	del_timer_sync(&peer->timer_send_keepalive);
-	del_timer_sync(&peer->timer_new_handshake);
-	del_timer_sync(&peer->timer_zero_key_material);
-	del_timer_sync(&peer->timer_persistent_keepalive);
-	flush_work(&peer->clear_peer_work);
+	del_timer_sync(&peer->timer_retransmit_handshake);  // 同步删除握手重传定时器
+	del_timer_sync(&peer->timer_send_keepalive);        // 同步删除保活发送定时器
+	del_timer_sync(&peer->timer_new_handshake);         // 同步删除新握手定时器
+	del_timer_sync(&peer->timer_zero_key_material);     // 同步删除密钥清零定时器
+	del_timer_sync(&peer->timer_persistent_keepalive);  // 同步删除持久保活定时器
+	flush_work(&peer->clear_peer_work);                 // 刷新并等待密钥清零工作完成
 }
