@@ -888,7 +888,7 @@ int wg_socket_init(struct wg_device *wg, u16 port)
 	struct udp_tunnel_sock_cfg cfg = {
 		.sk_user_data = wg,
 		.encap_type = 1,
-		.encap_rcv = wg_receive
+		.encap_rcv = wg_receive // 设置UDP接受回调
 	};
 	struct socket *new4 = NULL, *new6 = NULL;
 	struct udp_port_cfg port4 = {
@@ -919,7 +919,7 @@ int wg_socket_init(struct wg_device *wg, u16 port)
 retry:
 #endif
 
-	ret = udp_sock_create(net, &port4, &new4);
+	ret = udp_sock_create(net, &port4, &new4);// 创建UDP监听（端口51820）
 	if (ret < 0) {
 		pr_err("%s: Could not create IPv4 socket\n", wg->dev->name);
 		goto out;
