@@ -454,7 +454,7 @@ void wg_packet_tx_worker(struct work_struct *work)
 		keypair = PACKET_CB(first)->keypair;
 
 		/* 根据数据包状态进行处理 */
-		if (likely(state == PACKET_STATE_CRYPTED)) {
+		if (likely(state == PACKET_STATE_CRYPTED)) {// aw:上面是加密包，加密成功才发送呢！
 			/* 包已成功加密，发送它 */
 			wg_packet_create_data_done(peer, first);
 		} else {
