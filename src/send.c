@@ -400,7 +400,11 @@ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *fir
 	struct sk_buff *skb, *next;
 	bool is_keepalive, data_sent = false;
 
-	/* 更新定时器状态：有认证数据包通过和发送 */
+	/* 阶段 1：更新定时器状态：有认证数据包通过和发送 */
+// 	  作用：
+//   - 通知定时器系统有已认证的数据包通过
+//   - 更新最后一次发送数据包的时间戳
+//   - 用于触发相关的超时管理（如连接保活、重新握手等）
 	wg_timers_any_authenticated_packet_traversal(peer);
 	wg_timers_any_authenticated_packet_sent(peer);
 	
@@ -410,6 +414,7 @@ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *fir
 		is_keepalive = skb->len == message_data_len(0);
 		
 		/* 发送数据包到对等节点 */
+		// aw:准备走内核发送到对端了
 		if (likely(!wg_socket_send_skb_to_peer(peer, skb,
 				PACKET_CB(skb)->ds) && !is_keepalive))
 			data_sent = true;  /* 记录成功发送了非-keepalive 数据 */

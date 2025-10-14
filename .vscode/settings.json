@@ -14,6 +14,7 @@
         "__node_handle": "c",
         "peerlookup.h": "c",
         "curve25519.h": "c",
-        "chacha20poly1305.h": "c"
+        "chacha20poly1305.h": "c",
+        "dst_metadata.h": "c"
     }
 }
