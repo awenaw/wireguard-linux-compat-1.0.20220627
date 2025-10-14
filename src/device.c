@@ -62,6 +62,7 @@ static LIST_HEAD(device_list); /* 全局设备列表，用于系统级操作 */
 /* 
  * 网络设备启动函数 - 当 'ip link set wg0 up' 时调用
  * 初始化 UDP socket，发送缓存的数据包，启动 keepalive
+ * aw:他注册到了下面的netdev_ops函数表中
  */
 static int wg_open(struct net_device *dev)
 {
