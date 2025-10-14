@@ -195,6 +195,8 @@ static int wg_stop(struct net_device *dev)
  * 数据包传输函数 - WireGuard 的核心数据路径
  * 实现 cryptokey routing：根据目标 IP 查找对应的 peer，
  * 然后加密并通过 UDP 隧道发送数据包
+ * 
+ * aw:重点函数
  */
 static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
 {
