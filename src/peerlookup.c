@@ -149,6 +149,7 @@ struct pubkey_hashtable *wg_pubkey_hashtable_alloc(void)
 
 /**
  * wg_pubkey_hashtable_add - 将对等体添加到公钥哈希表
+ * aw:peer添加到公钥哈希表
  * @table: 公钥哈希表指针
  * @peer: 要添加的对等体
  * 
