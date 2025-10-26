@@ -362,6 +362,7 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
 	
 	// 根据端点地址族类型选择相应的发送函数
 	if (peer->endpoint.addr.sa_family == AF_INET)       // IPv4地址族
+	// aw: peer->endpoint 是目标地址信息
 		ret = send4(peer->device, skb, &peer->endpoint, ds,
 			    &peer->endpoint_cache);
 	else if (peer->endpoint.addr.sa_family == AF_INET6) // IPv6地址族
