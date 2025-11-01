@@ -547,7 +547,7 @@ void wg_timers_handshake_complete(struct wg_peer *peer)
  * │  • 防止长期使用同一密钥的安全风险                                            │
  * │  • 确保定期更新加密上下文                                                    │
  * │                                                                              │
- * │  参数：peer - 派生会话密钥的对等节点                                         │
+ * │  参数：peer - 派生会话密钥的对等节点(aw 远端，非自己)                                         │
  * └──────────────────────────────────────────────────────────────────────────────┘
  */
 void wg_timers_session_derived(struct wg_peer *peer)
