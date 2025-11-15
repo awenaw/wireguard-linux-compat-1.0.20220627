@@ -281,7 +281,7 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
 		__skb_queue_tail(&packets, skb);
 	}
 
-	/* 将数据包添加到 peer 的待发送队列 */
+	/* 将数据包添加到 peer 的待发送队列（aw-自旋锁） */
 	spin_lock_bh(&peer->staged_packet_queue.lock);
 	/* 如果队列过大，删除最旧的数据包防止内存耗尽
 	 * 在添加新包之前删除，避免删除刚分段的 GSO 包
