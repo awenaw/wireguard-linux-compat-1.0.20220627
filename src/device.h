@@ -45,13 +45,13 @@ struct wg_device {
 	struct noise_static_identity static_identity;
 	struct workqueue_struct *packet_crypt_wq,*handshake_receive_wq, *handshake_send_wq;
 	struct cookie_checker cookie_checker;
-	struct pubkey_hashtable *peer_hashtable;
+	struct pubkey_hashtable *peer_hashtable;// 快速查找 peer 的哈希表
 	struct index_hashtable *index_hashtable;
 	struct allowedips peer_allowedips;
 	struct mutex device_update_lock, socket_update_lock;
-	struct list_head device_list, peer_list;
+	struct list_head device_list, peer_list; // 管理所有 peer 的链表头
 	atomic_t handshake_queue_len;
-	unsigned int num_peers, device_update_gen;
+	unsigned int num_peers, device_update_gen;// aw:num_peers:当前 peer 数量
 	u32 fwmark;
 	u16 incoming_port;
 };
